@@ -1,4 +1,4 @@
-"""STASH SCAN PRO v2.1 - educational multi-timeframe radar, NEVER an MT5 execution feed."""
+"""STASH SCAN PRO v3.0 - educational multi-timeframe radar, NEVER an MT5 execution feed."""
 from __future__ import annotations
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
@@ -22,7 +22,7 @@ PRICE_NOTE = 'Futures proxy (GC=F/NQ=F), NI cena XAUUSD/NDX100 na MT5.'
 
 def client() -> requests.Session:
     s = requests.Session()
-    s.headers.update({'User-Agent': 'Mozilla/5.0 (compatible; StashScanPro/2.1; personal research)'})
+    s.headers.update({'User-Agent': 'Mozilla/5.0 (compatible; StashScanPro/2.1; personal research v3)'})
     retry = Retry(total=2, connect=2, read=2, backoff_factor=0.7,
                   status_forcelist=[429, 500, 502, 503, 504])
     s.mount('https://', HTTPAdapter(max_retries=retry))
@@ -244,36 +244,45 @@ def detect_signal(name: str, ticker: str, m1: pd.DataFrame, now: datetime) -> tu
 
 
 def get_usd_news(now: datetime, session: requests.Session) -> tuple[bool, str]:
-    """Fail closed: an unavailable unofficial calendar must not be called news-safe."""
+    """Conservative third-party calendar filter, not a complete official economic schedule.
+
+    An incomplete feed must never be represented as proof that no news is scheduled.
+    """
     try:
         r = session.get('https://nfs.faireconomy.media/ff_calendar_thisweek.json', timeout=10)
         r.raise_for_status()
         events = r.json()
-        if not isinstance(events, list) or len(events) == 0:
-            raise ValueError('empty calendar')
-        high_events = []
+        if not isinstance(events, list) or not events:
+            raise ValueError('empty economic calendar')
+        relevant = []
         for item in events:
-            if item.get('country') != 'USD' or str(item.get('impact', '')).lower() != 'high':
+            if str(item.get('country', '')).upper() != 'USD':
+                continue
+            impact = str(item.get('impact', '')).lower()
+            if impact not in ('high', 'medium'):
                 continue
             when = datetime.fromisoformat(str(item.get('date', '')).replace('Z', '+00:00'))
             if when.tzinfo is None:
-                raise ValueError('calendar event without timezone')
-            high_events.append((when.astimezone(UTC), str(item.get('title', 'USD news'))))
-        if not high_events:
-            raise ValueError('no high-impact USD events in calendar; uncertain coverage')
-        closest = sorted(high_events, key=lambda a: abs((a[0] - now).total_seconds()))[0]
-        dt = (closest[0] - now).total_seconds()/60
-        if -45 <= dt <= 30:
-            return True, f'🚨 HIGH USD: {closest[1]} ({closest[0].astimezone(SI):%d.%m. %H:%M} SI, {dt:+.0f} min)'
-        forthcoming = sorted((e for e in high_events if e[0] > now), key=lambda a: a[0])
-        if forthcoming:
-            nxt = forthcoming[0]
-            return False, f'Koledar OK; naslednja High USD: {nxt[1]} ({nxt[0].astimezone(SI):%d.%m. %H:%M} SI)'
-        return False, 'Koledar OK; danes ni nadaljnjih navedenih High USD dogodkov'
+                raise ValueError('event missing timezone')
+            relevant.append((when.astimezone(UTC), str(item.get('title', 'USD event')), impact))
+        if not relevant:
+            raise ValueError('no USD medium/high events returned; coverage uncertain')
+        nearby = sorted(relevant, key=lambda x: abs((x[0] - now).total_seconds()))
+        for when, label, impact in nearby:
+            minutes = (when - now).total_seconds() / 60
+            # Keep all impact levels out of immediate macro volatility.
+            if -35 <= minutes <= 40:
+                return True, (f'USD {impact.upper()} {label} '
+                              f'({when.astimezone(SI):%H:%M} SI, {minutes:+.0f}min)')
+        future = sorted((event for event in relevant if event[0] > now), key=lambda x: x[0])
+        if future:
+            ev = future[0]
+            return False, (f'Neuraden koledar: naslednja USD {ev[2]} '
+                           f'{ev[1]} {ev[0].astimezone(SI):%H:%M} SI; pokritost ni popolna')
+        return False, 'Neuraden koledar: ni naslednje najavljene USD objave; pokritost ni popolna'
     except Exception as exc:
-        LOG.warning('News calendar unavailable: %s', type(exc).__name__)
-        return True, 'KOLEDAR NEPREVERJEN — brez novih alertov; preveri novice ročno'
-
+        LOG.warning('News source unavailable: %s', type(exc).__name__)
+        return True, 'USD KOLEDAR NEPREVERJEN — novi signali blokirani'
 
 def format_signal(s: Signal, news: str, allowed: bool) -> str:
     time_si = s.candle_at.astimezone(SI).strftime('%d.%m. %H:%M')
@@ -422,3 +431,154 @@ def format_watch(info: dict) -> str:
             f"Zadnja M1: {info['bar_at'].astimezone(SI):%H:%M} SI, zamik {info['age_min']:.1f} min.\n"
             'Potrditev M5 BOS, svež M1 retest in brokerjev bid/ask še zahtevani.\n'
             'To je WATCHLIST, NE BUY/SELL signal za FundedNext.')
+
+# ------------------ v3 compact signal decision layer ------------------
+@dataclass(frozen=True)
+class TradeIdea:
+    signal: Signal
+    mode: str        # SCALP (fast) or INTRADAY (longer)
+    expires_at: datetime
+
+    @property
+    def key(self) -> str:
+        return self.mode + ':' + self.signal.key
+
+
+def _source_delay(m1: pd.DataFrame, now: datetime) -> float:
+    if m1.empty:
+        return float('inf')
+    return (pd.Timestamp(now) - (m1.index[-1] + pd.Timedelta(minutes=1))).total_seconds() / 60
+
+
+def detect_scalp(name: str, ticker: str, m1: pd.DataFrame, now: datetime) -> tuple[Optional[TradeIdea], str]:
+    """Strict confirmation, only fully closed bars; does not chase a live breakout.
+
+    This does NOT solve execution: proxy candles lack the broker's bid/ask and spread.
+    """
+    if len(m1) < 400:
+        return None, 'premalo zgodovine'
+    age = _source_delay(m1, now)
+    if not -0.1 <= age <= 1.5:
+        return None, f'M1 podatki zamuja(jo) {age:.1f} min'
+    if m1.index[-1] - m1.index[-25] > pd.Timedelta(minutes=30):
+        return None, 'manjkajo M1 sveče'
+    m5 = resample_closed(m1, '5min', now)
+    m15 = resample_closed(m1, '15min', now)
+    h1 = resample_closed(m1, '1h', now)
+    if min(len(m5), len(m15), len(h1)) < 55:
+        return None, 'premalo H1/M15/M5 sveč'
+    trend = ema_bias(h1)
+    if trend not in ('BUY', 'SELL') or ema_bias(m15) != trend or ema_bias(m5) != trend:
+        return None, 'H1/M15/M5 trend ni usklajen'
+    structure = swing_structure(h1)
+    if (trend == 'BUY' and structure == 'LH/LL') or (trend == 'SELL' and structure == 'HH/HL'):
+        return None, 'H1 struktura proti smeri'
+    vol = atr(m5)
+    a = float(vol.iloc[-1])
+    base = float(vol.tail(24).median())
+    if not math.isfinite(a) or a <= 0 or not math.isfinite(base) or base <= 0:
+        return None, 'ATR ni veljaven'
+    if a > 1.9 * base:
+        return None, 'prevelika volatilnost (ne lovimo spikea)'
+    if len(m5) < 12:
+        return None, 'premalo M5 sveč'
+    # Most recent break of a 5-candle range, confirmed on fully closed M5.
+    break_found = None
+    for i in range(len(m5) - 1, len(m5) - 5, -1):
+        if i < 5:
+            break
+        c = m5.iloc[i]
+        prior = m5.iloc[i-5:i]
+        level = float(prior.high.max() if trend == 'BUY' else prior.low.min())
+        if trend == 'BUY':
+            is_break = c.close > level and c.close > c.open and (c.close-c.open) >= 0.25*(c.high-c.low)
+        else:
+            is_break = c.close < level and c.close < c.open and (c.open-c.close) >= 0.25*(c.high-c.low)
+        if is_break:
+            break_found = (m5.index[i], level)
+            break
+    if break_found is None:
+        return None, 'ni potrjenega M5 BOS'
+    bos_ts, level = break_found
+    stamp = m1.index[-1]
+    if stamp < bos_ts + pd.Timedelta(minutes=5):
+        return None, 'M5 BOS še ni potrjen'
+    if stamp > bos_ts + pd.Timedelta(minutes=16):
+        return None, 'M5 BOS je prestar za scalp'
+    c = m1.iloc[-1]
+    pad = 0.17 * a
+    candle_range = max(1e-6, float(c.high - c.low))
+    body_ratio = abs(float(c.close - c.open)) / candle_range
+    if body_ratio < 0.42:
+        return None, 'M1 odboj ni dovolj močan'
+    if trend == 'BUY':
+        confirmed = c.low <= level + pad and c.close > level and c.close > c.open
+    else:
+        confirmed = c.high >= level - pad and c.close < level and c.close < c.open
+    if not confirmed:
+        return None, 'čaka M1 retest + rejection'
+    entry = float(c.close)
+    tail = m1.tail(10)
+    if trend == 'BUY':
+        stop = min(float(tail.low.min()), level - 0.14*a) - 0.06*a
+        risk = entry - stop
+        tp1, tp2 = entry + 1.25*risk, entry + 2.0*risk
+    else:
+        stop = max(float(tail.high.max()), level + 0.14*a) + 0.06*a
+        risk = stop - entry
+        tp1, tp2 = entry - 1.25*risk, entry - 2.0*risk
+    if risk < 0.12*a or risk > 1.30*a:
+        return None, 'SL ni smiseln glede na ATR'
+    if abs(entry-level) > 0.60*a:
+        return None, 'cena predaleč od retesta'
+    sig = Signal(name, ticker, trend, stamp.to_pydatetime(), bos_ts.to_pydatetime(),
+                 entry, stop, tp1, tp2, 4, trend, trend,
+                 'H1/M15/M5 trend + M5 BOS + M1 retest', round(age, 2))
+    return TradeIdea(sig, 'SCALP', (stamp + pd.Timedelta(minutes=4)).to_pydatetime()), 'setup'
+
+
+def select_trade(name: str, ticker: str, m1: pd.DataFrame, now: datetime,
+                 news_block: bool) -> tuple[Optional[TradeIdea], str]:
+    """Select one strategy; only accept news-verified, genuinely fresh data.
+
+    Priority to M15 sweep/M5 BOS longer setup, otherwise H1-trend scalp.
+    No 'confidence %' is shown because none has been statistically calibrated.
+    """
+    age = _source_delay(m1, now)
+    if not -0.1 <= age <= 2.5:
+        return None, f'VIR ZAMUJA {max(0.0, age):.1f} min'
+    if news_block:
+        return None, 'NOVICE / KOLEDAR NEPREVERJEN'
+    intraday, long_reason = detect_signal(name, ticker, m1, now)
+    if intraday:
+        # The existing M15 sweep setup is longer by construction.
+        long_idea = TradeIdea(intraday, 'INTRADAY', intraday.candle_at + timedelta(minutes=12))
+        if now <= long_idea.expires_at:
+            return long_idea, 'setup'
+    scalp, short_reason = detect_scalp(name, ticker, m1, now)
+    if scalp and now <= scalp.expires_at:
+        return scalp, 'setup'
+    # Make the reason useful but concise in Telegram.
+    return None, f'NI POTRDITVE: {short_reason}; {long_reason}'[:130]
+
+
+def compact_trade(idea: TradeIdea, now: datetime) -> str:
+    """Deliberately NOT an executable MT5 order: this feed is a futures proxy."""
+    s = idea.signal
+    digits = lambda price: f'{price:,.2f}'
+    expiry = idea.expires_at.astimezone(SI).strftime('%H:%M')
+    return (f'🧪 {s.name.replace("GOLD_FUTURES_PROXY", "XAUUSD").replace("NASDAQ_FUTURES_PROXY", "NDX100")} '
+            f'— {s.direction} | {idea.mode} (TEST)\n'
+            f'ENTRY {digits(s.entry)} | SL {digits(s.stop)}\n'
+            f'TP1 {digits(s.tp1)} | TP2 {digits(s.tp2)}\n'
+            f'RR TP2 1:2 | veljavno do {expiry} SI\n'
+            f'{s.reason}\n'
+            f'⛔ GC=F/NQ=F proxy, NE MT5 nivoji. Potrdi na live brokerjevem chartu.')
+
+
+def compact_no_trade(name: str, df: Optional[pd.DataFrame], now: datetime,
+                     reason: str) -> str:
+    friendly = 'XAUUSD' if name.startswith('GOLD') else 'NDX100'
+    age = _source_delay(df, now) if df is not None else float('inf')
+    delay = f'{max(0.0, age):.1f}m' if math.isfinite(age) else 'N/A'
+    return f'⚪ {friendly} — NO TRADE | zamik {delay}\n{reason[:110]}'

@@ -1,4 +1,4 @@
-"""STASH SCAN PRO v2.1 — five-minute research bot for Telegram (not trade execution).
+"""STASH SCAN PRO v3.0 — five-minute research bot for Telegram (not trade execution).
 
 Public repository safe: credentials must be GitHub Actions Secrets, never code.
 One program invocation per scheduled GitHub Actions run; no always-on poller.
@@ -14,16 +14,15 @@ from zoneinfo import ZoneInfo
 
 import requests
 from scan_engine import (
-    SYMBOLS, client, detect_signal, find_sweep, format_overview,
-    format_signal, format_watch, get_usd_news, market_overview,
-    resample_closed, yahoo_1m,
+    SYMBOLS, client, compact_no_trade, compact_trade, format_overview,
+    get_usd_news, market_overview, select_trade, yahoo_1m,
 )
 
 LOG = logging.getLogger('stash_scan_pro')
 STATE_PATH = Path('bot_state.json')
 SI = ZoneInfo('Europe/Ljubljana')
 MAX_TRACKED = 75
-VERSION = 'STASH SCAN PRO v2.1'
+VERSION = 'STASH SCAN PRO v3.0'
 
 
 def state_load() -> dict:
@@ -143,7 +142,7 @@ def main():
             if cmd in ('/id', '/start') and target and chat.get('type') in ('group', 'supergroup'):
                 tg.say(target, '✅ ID skupine: ' + target + '\nShrani v GitHub Secret TELEGRAM_CHAT_ID.')
         elif target == group:
-            if cmd in ('/scan', '/status', '/help', '/risk', '/stats', '/news', '/id', '/start'):
+            if cmd in ('/scan', '/detail', '/status', '/help', '/risk', '/stats', '/news', '/id', '/start'):
                 commands.append(cmd)
     if not group:
         state_save(state)
@@ -153,11 +152,11 @@ def main():
     if '/id' in commands:
         tg.say(group, f'✅ ID skupine: {group}')
     if '/help' in commands or '/start' in commands:
-        tg.say(group, f'🤖 {VERSION}\n/scan — H4/H1/M30/M15/M5, HH/HL, PDH/PDL, liquidity, BOS\n/news — HIGH USD koledar\n/stats — testni rezultati\n/status — stanje\n/risk — risk okvir\nZagoni ~5 min (lahko zamujajo), Yahoo futures vir je zamaknjen.')
+        tg.say(group, f'🤖 {VERSION}\n/scan — kratek BUY/SELL, SCALP/INTRADAY, ENTRY/SL/TP ali NO TRADE\n/detail — celotna analiza H4→M1 + struktura\n/news — neuradni koledar\n/stats — samo hipotetični testni rezultati\n/status — stanje\n/risk — okvir rizika\n⛔ Futures proxy, ne MT5. GitHub zagoni se lahko zamikajo.')
     if '/risk' in commands:
         tg.say(group, '🛡️ Primer za račun 15.000 $: 0,25 % = 37,50 $, 0,5 % = 75 $. Velikost lota je odvisna od dejanskega brokerjevega SL in specifikacije instrumenta. Brez lovljenja izgub; največ dve izgubi in konec dneva. Raziskovalni alerts niso trgovalna navodila.')
     if '/status' in commands:
-        tg.say(group, f'✅ {VERSION}: ukazi delujejo | {now.astimezone(SI):%d.%m. %H:%M} SI\nSchedule: GitHub lahko zamika ali izpušča zagone. Vir: GC=F / NQ=F, ni MT5 live feed. Najboljši varnostni filter: NO TRADE pri >2,5-minutni zamudi.')
+        tg.say(group, f'✅ {VERSION} | {now.astimezone(SI):%H:%M} SI\nVir GC=F/NQ=F futures; M1 starejši od 2.5 min blokiran.\nSCALP ali INTRADAY le ob potrditvi; zgolj raziskovalni nivoji.')
     if '/stats' in commands:
         tg.say(group, stats_message(state))
 
@@ -166,47 +165,47 @@ def main():
     if '/news' in commands:
         tg.say(group, '🗓️ USD NOVICE\n' + news + '\nVir: neuradni gospodarski koledar, ne spremlja X/Twitter. Preveri uradni koledar tudi ročno.')
 
-    report = [f'🔎 {VERSION} — {now.astimezone(SI):%d.%m. %H:%M} SI',
-              '⚠️ GC=F/NQ=F futures proxy, NE brokerjev XAUUSD/NDX100.',
-              '🗓️ ' + news]
+    report = [f'🔎 {VERSION} • {now.astimezone(SI):%H:%M} SI']
+    details = [f'🔎 {VERSION} — H4→M1 • {now.astimezone(SI):%d.%m. %H:%M} SI',
+               'VIR: GC=F/NQ=F futures proxy, NE MT5 | Koledar: ' + news]
     alerts_sent = 0
     for name, ticker in SYMBOLS.items():
         try:
             df = yahoo_1m(ticker, session, now)
             paper_update(state, ticker, df, now)
-            sig, reason = detect_signal(name, ticker, df, now)
-            info = market_overview(name, ticker, df, now, reason)
-            report.append(format_overview(info))
-            if news_block:
-                # Fail closed if news source is broken; never invent 'news-safe'.
-                continue
-            if sig is not None and sig.key not in state['sent_keys']:
-                tg.say(group, format_signal(sig, news, True))
-                state['sent_keys'] = (state['sent_keys'] + [sig.key])[-300:]
-                state['paper_trades'].append({
-                    'ticker': sig.ticker, 'direction': sig.direction,
-                    'candle_at': sig.candle_at.isoformat(), 'entry': sig.entry,
-                    'stop': sig.stop, 'tp2': sig.tp2, 'outcome': 'OPEN',
-                })
-                state['paper_trades'] = state['paper_trades'][-MAX_TRACKED:]
-                alerts_sent += 1
-            # A delayed M15 structural heads-up is okay, if unambiguously labelled
-            # WATCHLIST with no executable order and no price in the alert.
-            elif not info['data_fresh'] and info['age_min'] <= 30:
-                b = info['bias']
-                sw = info['sweep']
-                if b['H1'] in ('BUY', 'SELL') and b['H1'] == b['M30'] and sw:
-                    m15 = resample_closed(df, '15min', now)
-                    if len(m15) >= 3 and sw[0] >= m15.index[-3]:
-                        key = f'watch:{ticker}:{b["H1"]}:{sw[0].isoformat()}'
-                        if key not in state['watch_keys']:
-                            tg.say(group, format_watch(info))
-                            state['watch_keys'] = (state['watch_keys'] + [key])[-200:]
+            idea, reason = select_trade(name, ticker, df, now, news_block)
+            if idea is not None:
+                item = compact_trade(idea, now)
+                report.append(item)
+                if idea.key not in state['sent_keys'] and now <= idea.expires_at:
+                    # One test notification per confirmed candle, never the same signal twice.
+                    # Not execution advice: futures proxy can diverge from FundedNext.
+                    if '/scan' not in commands:
+                        tg.say(group, item)
+                    state['sent_keys'] = (state['sent_keys'] + [idea.key])[-300:]
+                    sig = idea.signal
+                    state['paper_trades'].append({
+                        'ticker': sig.ticker, 'direction': sig.direction,
+                        'mode': idea.mode, 'candle_at': sig.candle_at.isoformat(),
+                        'entry': sig.entry, 'stop': sig.stop, 'tp2': sig.tp2,
+                        'outcome': 'OPEN',
+                    })
+                    state['paper_trades'] = state['paper_trades'][-MAX_TRACKED:]
+                    alerts_sent += 1
+            else:
+                report.append(compact_no_trade(name, df, now, reason))
+            if '/detail' in commands:
+                info = market_overview(name, ticker, df, now, reason)
+                details.append(format_overview(info))
         except Exception as exc:
             LOG.error('Radar %s unavailable: %s', ticker, type(exc).__name__)
-            report.append(f'⚠️ {name}: NO TRADE (vir ni na voljo: {type(exc).__name__})')
+            message = f'VIR NI NA VOLJO ({type(exc).__name__})'
+            report.append(compact_no_trade(name, None, now, message))
+            details.append(f'{name} — NO TRADE: {message}')
     if '/scan' in commands:
-        tg.say(group, '\n\n'.join(report))
+        tg.say(group, '\n\n'.join(report) + '\n\n⚠️ Proxy raziskovalni podatki. Ni brokerjevih MT5 entryjev.')
+    if '/detail' in commands:
+        tg.say(group, '\n\n'.join(details))
     state_save(state)
     LOG.info('Finished %s; requests=%s; proxy research alerts=%d', VERSION, commands, alerts_sent)
 
