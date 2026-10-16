@@ -1,7 +1,9 @@
 {
   "last_update_id": 733686640,
   "sent_keys": [],
-  "watch_keys": [],
+  "watch_keys": [
+    "watch:GC=F:BUY:2026-10-16T11:00:00+00:00"
+  ],
   "paper_trades": [],
   "last_scan": ""
 }
