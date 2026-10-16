@@ -1,12 +1,10 @@
-"""Transparent, educational signal scanner, not a broker execution system."""
+"""STASH SCAN PRO v2.1 - educational multi-timeframe radar, NEVER an MT5 execution feed."""
 from __future__ import annotations
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
 import logging
 import math
-import os
-import time
 from typing import Optional
 from urllib.parse import quote
 
@@ -24,7 +22,7 @@ PRICE_NOTE = 'Futures proxy (GC=F/NQ=F), NI cena XAUUSD/NDX100 na MT5.'
 
 def client() -> requests.Session:
     s = requests.Session()
-    s.headers.update({'User-Agent': 'Mozilla/5.0 (compatible; StashScanFree/1.0; personal research)'})
+    s.headers.update({'User-Agent': 'Mozilla/5.0 (compatible; StashScanPro/2.1; personal research)'})
     retry = Retry(total=2, connect=2, read=2, backoff_factor=0.7,
                   status_forcelist=[429, 500, 502, 503, 504])
     s.mount('https://', HTTPAdapter(max_retries=retry))
@@ -68,11 +66,23 @@ def yahoo_1m(ticker: str, session: requests.Session | None = None, now: datetime
 
 
 def resample_closed(df: pd.DataFrame, freq: str, now: datetime) -> pd.DataFrame:
-    """UTC-aligned timeframes; filters the forming period."""
-    bars = df.resample(freq, label='left', closed='left').agg(
-        {'open': 'first', 'high': 'max', 'low': 'min', 'close': 'last'}).dropna()
-    period = pd.Timedelta(freq)
-    return bars[bars.index + period <= pd.Timestamp(now)]
+    """Only closed, reasonably complete buckets; no incomplete candle masquerades as M15/H1.
+
+    Yahoo may publish bars with a lag. A bucket is NOT complete merely because the
+    wall-clock passed its end: it must also contain recent source observations.
+    """
+    frame = df.sort_index()
+    grouped = frame.resample(freq, label='left', closed='left')
+    bars = grouped.agg({'open': 'first', 'high': 'max', 'low': 'min', 'close': 'last'}).dropna()
+    mins = pd.Timedelta(freq) / pd.Timedelta(minutes=1)
+    counts = grouped['close'].count().reindex(bars.index).fillna(0)
+    latest_observation = frame.index.to_series().resample(freq, label='left', closed='left').max()
+    latest_observation = latest_observation.reindex(bars.index)
+    end = bars.index + pd.Timedelta(freq)
+    covered = counts >= max(1, int(math.ceil(mins * 0.80)))
+    tail_complete = (end - pd.Timedelta(minutes=1) - latest_observation) <= pd.Timedelta(minutes=2)
+    finished = end <= pd.Timestamp(now)
+    return bars[covered & tail_complete & finished]
 
 
 def atr(df: pd.DataFrame, length=14) -> pd.Series:
@@ -159,25 +169,32 @@ def find_bos(m5: pd.DataFrame, direction: str, after: datetime, lookback=5):
 
 
 def detect_signal(name: str, ticker: str, m1: pd.DataFrame, now: datetime) -> tuple[Optional[Signal], str]:
-    """Only closed bars. Data freshness determines whether this is useful as live info."""
+    """Conditional research setup; must have near-current candles for a time-sensitive alert."""
     if m1.empty or len(m1) < 400:
         return None, 'premalo sveč'
     age = (pd.Timestamp(now) - (m1.index[-1] + pd.Timedelta(minutes=1))).total_seconds() / 60
     if age < -0.1:
         return None, 'nepravilna ura podatkov'
-    if age > 20:
-        return None, f'zastareli podatki ({age:.0f} min)'
+    if age > 2.5:
+        return None, f'zastareli podatki ({age:.1f} min) — M1 SIGNAL BLOKIRAN'
+    if m1.index[-1] - m1.index[-20] > pd.Timedelta(minutes=25):
+        return None, 'luknje v M1 podatkih — signal blokiran'
     m5 = resample_closed(m1, '5min', now)
     m15 = resample_closed(m1, '15min', now)
     m30 = resample_closed(m1, '30min', now)
     h1 = resample_closed(m1, '1h', now)
     if min(len(m5), len(m15), len(m30), len(h1)) < 58:
-        return None, 'premalo zgodovine za vse timeframe'
-    h1_dir = ema_bias(h1)
-    m30_dir = ema_bias(m30)
+        return None, 'premalo popolnih sveč za vse timeframe'
+    h1_dir, m30_dir = ema_bias(h1), ema_bias(m30)
     if h1_dir == 'NEUTRAL' or h1_dir != m30_dir:
         return None, f'ni soglasja H1={h1_dir}, M30={m30_dir}'
     d = h1_dir
+    structure = swing_structure(h1)
+    if (d == 'BUY' and structure == 'LH/LL') or (d == 'SELL' and structure == 'HH/HL'):
+        return None, f'H1 swing struktura {structure} nasprotuje EMA trendu'
+    m15_bias = ema_bias(m15)
+    if m15_bias != 'NEUTRAL' and m15_bias != d:
+        return None, f'M15 bias {m15_bias} nasprotuje H1 {d}'
     sw = find_sweep(m15, d)
     if sw is None:
         return None, f'ni svežega M15 liquidity sweep ({d})'
@@ -186,7 +203,6 @@ def detect_signal(name: str, ticker: str, m1: pd.DataFrame, now: datetime) -> tu
     if bos is None:
         return None, 'ni potrjenega M5 break of structure'
     bos_ts, level = bos
-    # One M1 close, no retrospective price guessing: use last fully closed M1 bar.
     candle = m1.iloc[-1]
     stamp = m1.index[-1]
     if stamp < bos_ts + pd.Timedelta(minutes=5):
@@ -202,56 +218,61 @@ def detect_signal(name: str, ticker: str, m1: pd.DataFrame, now: datetime) -> tu
     else:
         confirmed = candle.high >= level - pad and candle.close < level and candle.close < candle.open
     if not confirmed:
-        return None, 'čakamo bullish/bearish M1 retest'
+        return None, 'čakamo potrjen M1 retest'
     entry = float(candle.close)
-    # Stop based on structural M5 displacement & sweep, bounded to avoid oversized stop.
     recent = m5[m5.index >= pd.Timestamp(bos_ts) - pd.Timedelta(minutes=15)]
     if d == 'BUY':
         stop = min(float(recent.low.min()), extreme) - 0.1 * a
         risk = entry - stop
         nearest = float(m15.high.tail(16).max())
-        if nearest <= entry + 1.5 * risk:
-            return None, 'premalo prostora do M15 upora'
+        if nearest <= entry + 2.0 * risk:
+            return None, 'premalo prostora do M15 upora za TP2'
         tp1, tp2 = entry + 1.5 * risk, entry + 2.0 * risk
     else:
         stop = max(float(recent.high.max()), extreme) + 0.1 * a
         risk = stop - entry
         nearest = float(m15.low.tail(16).min())
-        if nearest >= entry - 1.5 * risk:
-            return None, 'premalo prostora do M15 podpore'
+        if nearest >= entry - 2.0 * risk:
+            return None, 'premalo prostora do M15 podpore za TP2'
         tp1, tp2 = entry - 1.5 * risk, entry - 2.0 * risk
-    if risk <= 0 or risk > 2.5 * a:
+    if risk <= 0 or risk > 2.5 * a or risk < 0.12 * a:
         return None, f'neprimerna razdalja SL ({risk:.2f})'
-    score = 4 + int(age <= 3)
+    score = 4 + int(structure in ('HH/HL' if d == 'BUY' else 'LH/LL',))
     return Signal(name, ticker, d, stamp.to_pydatetime(), sweep_ts.to_pydatetime(),
                   entry, stop, tp1, tp2, score, h1_dir, m30_dir,
                   'H1/M30 trend + M15 sweep + M5 BOS + M1 retest', round(age, 1)), 'setup'
 
 
 def get_usd_news(now: datetime, session: requests.Session) -> tuple[bool, str]:
-    """High-impact USD ForexFactory public mirror; fail closed at NY macro hours if unavailable."""
+    """Fail closed: an unavailable unofficial calendar must not be called news-safe."""
     try:
         r = session.get('https://nfs.faireconomy.media/ff_calendar_thisweek.json', timeout=10)
         r.raise_for_status()
-        items = r.json()
-        if not isinstance(items, list):
-            raise ValueError('invalid calendar format')
-        for item in items:
+        events = r.json()
+        if not isinstance(events, list) or len(events) == 0:
+            raise ValueError('empty calendar')
+        high_events = []
+        for item in events:
             if item.get('country') != 'USD' or str(item.get('impact', '')).lower() != 'high':
                 continue
-            raw = str(item.get('date', ''))
-            when = datetime.fromisoformat(raw.replace('Z', '+00:00'))
+            when = datetime.fromisoformat(str(item.get('date', '')).replace('Z', '+00:00'))
             if when.tzinfo is None:
                 raise ValueError('calendar event without timezone')
-            delta = (now - when.astimezone(UTC)).total_seconds() / 60
-            if -30 <= delta <= 30:
-                return True, f'High-impact USD: {item.get("title", "news")} ({when.astimezone(SI):%H:%M} SI)'
-        return False, 'Koledar preverjen (brez High USD v ±30 min)'
+            high_events.append((when.astimezone(UTC), str(item.get('title', 'USD news'))))
+        if not high_events:
+            raise ValueError('no high-impact USD events in calendar; uncertain coverage')
+        closest = sorted(high_events, key=lambda a: abs((a[0] - now).total_seconds()))[0]
+        dt = (closest[0] - now).total_seconds()/60
+        if -45 <= dt <= 30:
+            return True, f'🚨 HIGH USD: {closest[1]} ({closest[0].astimezone(SI):%d.%m. %H:%M} SI, {dt:+.0f} min)'
+        forthcoming = sorted((e for e in high_events if e[0] > now), key=lambda a: a[0])
+        if forthcoming:
+            nxt = forthcoming[0]
+            return False, f'Koledar OK; naslednja High USD: {nxt[1]} ({nxt[0].astimezone(SI):%d.%m. %H:%M} SI)'
+        return False, 'Koledar OK; danes ni nadaljnjih navedenih High USD dogodkov'
     except Exception as exc:
-        LOG.warning('News calendar unavailable: %s', exc)
-        if 12 <= now.hour < 18 and now.weekday() < 5:
-            return True, 'Koledar ni na voljo: konzervativno brez setupov 12–18 UTC'
-        return False, 'Koledar ni na voljo (preveri novice ročno)'
+        LOG.warning('News calendar unavailable: %s', type(exc).__name__)
+        return True, 'KOLEDAR NEPREVERJEN — brez novih alertov; preveri novice ročno'
 
 
 def format_signal(s: Signal, news: str, allowed: bool) -> str:
@@ -273,3 +294,131 @@ def format_signal(s: Signal, news: str, allowed: bool) -> str:
 def scan_status(name: str, ticker: str, df: pd.DataFrame, now: datetime, note: str) -> str:
     age = (pd.Timestamp(now) - df.index[-1] - pd.Timedelta(minutes=1)).total_seconds() / 60
     return f'{name} ({ticker}): {note}; zadnja zaprta M1 {df.index[-1].astimezone(SI):%H:%M} SI; zamik ~{age:.0f} min'
+
+
+# ------------------ STASH SCAN PRO v2: multi-timeframe research radar ------------------
+
+def swing_structure(frame: pd.DataFrame, left: int = 2, right: int = 2) -> str:
+    """HH/HL or LH/LL from confirmed fractal swings; no future-candle lookahead."""
+    if len(frame) < 20:
+        return 'RANGE'
+    f = frame.tail(160)
+    highs, lows = [], []
+    for i in range(left, len(f) - right):
+        hi = float(f.high.iloc[i]); lo = float(f.low.iloc[i])
+        if all(hi > float(x) for x in f.high.iloc[i-left:i]) and all(
+                hi >= float(x) for x in f.high.iloc[i+1:i+right+1]):
+            highs.append(hi)
+        if all(lo < float(x) for x in f.low.iloc[i-left:i]) and all(
+                lo <= float(x) for x in f.low.iloc[i+1:i+right+1]):
+            lows.append(lo)
+    if len(highs) < 2 or len(lows) < 2:
+        return 'RANGE'
+    if highs[-1] > highs[-2] and lows[-1] > lows[-2]:
+        return 'HH/HL'
+    if highs[-1] < highs[-2] and lows[-1] < lows[-2]:
+        return 'LH/LL'
+    return 'RANGE'
+
+
+def _last_complete_day_levels(df: pd.DataFrame, now: datetime):
+    local_index = df.index.tz_convert(SI)
+    day = now.astimezone(SI).date()
+    previous = sorted({d for d in local_index.date if d < day})
+    if not previous:
+        return None
+    prev = previous[-1]
+    sub = df[local_index.date == prev]
+    if len(sub) < 60:
+        return None
+    return float(sub.high.max()), float(sub.low.min()), str(prev)
+
+
+def _today_session_levels(df: pd.DataFrame, now: datetime):
+    idx = df.index.tz_convert(SI)
+    today = now.astimezone(SI).date()
+    # Simple Europe/Ljubljana clock-time segments (approximate sessions).
+    out = {}
+    for label, start, end in [('ASIA', 0, 8), ('LONDON', 8, 15), ('NEW_YORK', 15, 23)]:
+        mask = (idx.date == today) & (idx.hour >= start) & (idx.hour < end)
+        d = df[mask]
+        if len(d) > 3:
+            out[label] = (float(d.high.max()), float(d.low.min()))
+    return out
+
+
+def market_overview(name: str, ticker: str, m1: pd.DataFrame, now: datetime, reason: str) -> dict:
+    """Top-down context on closed historical bars only; never broker bid/ask."""
+    age = (pd.Timestamp(now) - (m1.index[-1] + pd.Timedelta(minutes=1))).total_seconds()/60
+    tf = {label: resample_closed(m1, freq, now) for label, freq in [
+        ('H4', '4h'), ('H1', '1h'), ('M30', '30min'), ('M15', '15min'), ('M5', '5min')]}
+    bias = {k: ema_bias(v) for k, v in tf.items()}
+    bias['M1'] = ema_bias(m1)
+    # Use a shorter H4 EMA only as context when seven days of candles is insufficient for EMA50.
+    if len(tf['H4']) >= 24:
+        h4 = tf['H4']; e8 = h4.close.ewm(span=8, adjust=False).mean().iloc[-1]
+        e20 = h4.close.ewm(span=20, adjust=False).mean().iloc[-1]
+        bias['H4'] = ('BUY' if h4.close.iloc[-1] > e8 > e20 else
+                       'SELL' if h4.close.iloc[-1] < e8 < e20 else 'NEUTRAL')
+    structure = swing_structure(tf['H1'])
+    m15_structure = swing_structure(tf['M15'])
+    m5_structure = swing_structure(tf['M5'])
+    pd_levels = _last_complete_day_levels(m1, now)
+    sessions = _today_session_levels(m1, now)
+    tr = atr(tf['M5']).iloc[-1] if len(tf['M5']) >= 15 else float('nan')
+    atr_val = float(tr) if math.isfinite(float(tr)) else None
+    m15 = tf['M15']; m5 = tf['M5']
+    close = float(m1.close.iloc[-1])
+    # Local structural levels are context, not direct MT5 entries.
+    upper = float(m15.high.tail(16).max()) if len(m15) >= 2 else None
+    lower = float(m15.low.tail(16).min()) if len(m15) >= 2 else None
+    swing = None
+    if len(m15) >= 18 and bias['H1'] == bias['M30'] and bias['H1'] in ('BUY', 'SELL'):
+        swing = find_sweep(m15, bias['H1'])
+    last_bos = None
+    if swing is not None and len(m5) >= 8:
+        last_bos = find_bos(m5, bias['H1'], swing[0])
+    return {'name': name, 'ticker': ticker, 'close': close, 'age_min': max(0, age),
+            'bar_at': m1.index[-1].to_pydatetime(), 'bias': bias, 'structure': structure,
+            'structure_m15': m15_structure, 'structure_m5': m5_structure,
+            'pdh_pdl': pd_levels, 'sessions': sessions, 'atr_m5': atr_val,
+            'resistance': upper, 'support': lower,
+            'sweep': swing, 'bos': last_bos,
+            'reason': reason, 'data_fresh': 0 <= age <= 2.5}
+
+
+def format_overview(info: dict) -> str:
+    """Fast Telegram /scan output with visible missing confirmation and latency."""
+    n = info
+    b = n['bias']; age = n['age_min']
+    is_fresh = n['data_fresh']
+    out = [f"{'🟡' if not is_fresh else '🔎'} {n['name']} ({n['ticker']}) — NO TRADE / RAZISKOVALNI PREGLED",
+           f"Vir: FUTURES PROXY, NE MT5 | zadnja M1 {n['bar_at'].astimezone(SI):%H:%M} SI | zamik {age:.1f} min",
+           f"Cena proxy: {n['close']:,.2f} (NI brokerjeva cena)",
+           f"H4={b['H4']} | H1={b['H1']} | M30={b['M30']} | M15={b['M15']} | M5={b['M5']} | M1={b['M1']}",
+           f"Struktura H1={n['structure']} | M15={n['structure_m15']} | M5={n['structure_m5']}"]
+    if n['pdh_pdl']:
+        h,l,d=n['pdh_pdl']; out.append(f'PDH/PDL {d}: {h:,.2f} / {l:,.2f}')
+    if n['sessions']:
+        out.append('Seje High/Low: ' + ' | '.join(f'{k} {v[0]:,.2f}/{v[1]:,.2f}' for k,v in n['sessions'].items()))
+    if n['support'] is not None:
+        out.append(f'M15 high/low zadnjih 16 zaprtih sveč: {n["resistance"]:,.2f} / {n["support"]:,.2f}')
+    if n['atr_m5'] is not None:
+        out.append(f'M5 ATR14: {n["atr_m5"]:.2f} (volatilnost)')
+    out.append('M15 sweep: ' + ('DA' if n['sweep'] else 'NE') + ' | M5 BOS: ' + ('DA' if n['bos'] else 'NE'))
+    out.append('Odločitev: ' + n['reason'])
+    if not is_fresh:
+        out.append('⛔ M1 ENTRY/SL/TP BLOKIRANI: zastarel vir. Preveri svoj MT5 live graf.')
+    else:
+        out.append('⚠️ Tudi svež futures signal ni izvršljiv MT5 signal: cene/spread so različni.')
+    return '\n'.join(out)
+
+
+def format_watch(info: dict) -> str:
+    b = info['bias']
+    return ('👀 STRUKTURNI WATCH — NE VSTOPAJ NA SLEPO\n'
+            f"{info['name']} ({info['ticker']}) | H1/M30 {b['H1']}\n"
+            'M15 liquidity sweep zaznan na zamujenem futures viru.\n'
+            f"Zadnja M1: {info['bar_at'].astimezone(SI):%H:%M} SI, zamik {info['age_min']:.1f} min.\n"
+            'Potrditev M5 BOS, svež M1 retest in brokerjev bid/ask še zahtevani.\n'
+            'To je WATCHLIST, NE BUY/SELL signal za FundedNext.')
