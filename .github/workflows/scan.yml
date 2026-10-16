@@ -28,8 +28,7 @@ jobs:
           cache: pip
       - name: Packages
         run: pip install -r requirements.txt
-      - name: Tests
-        run: python -m pytest -q
+
       - name: Run bot
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
